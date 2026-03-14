@@ -27,6 +27,9 @@ export default function GameCanvas({ players, onGameOver }) {
         mode: Phaser.Scale.RESIZE,
         autoCenter: Phaser.Scale.CENTER_BOTH,
       },
+      input: {
+        activePointers: 3, // support multi-touch (joystick + aim + button)
+      },
       render: {
         antialias: true,
         pixelArt: false,

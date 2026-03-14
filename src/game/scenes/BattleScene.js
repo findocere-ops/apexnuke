@@ -24,6 +24,14 @@ import {
   getWindLabel,
   getWindArrow,
 } from '../systems/GameState'
+import {
+  createTouchControls,
+  updateTouchAim,
+  getTouchAimAngle,
+  consumeTouchFire,
+  getJoystickMovement,
+  drawTouchControls,
+} from '../systems/TouchControls'
 
 export default class BattleScene extends Phaser.Scene {
   constructor() {
@@ -136,6 +144,30 @@ export default class BattleScene extends Phaser.Scene {
         this.scale.height / this.terrainData.worldHeight
       )
     )
+
+    // Touch controls (mobile)
+    this.touch = createTouchControls(this)
+    this.touchGraphics = this.add.graphics().setScrollFactor(0).setDepth(1000)
+
+    // Touch button labels (text can't be drawn on Graphics)
+    if (this.touch.enabled) {
+      const labelStyle = {
+        fontSize: '12px',
+        fontFamily: 'monospace',
+        color: '#ffffff',
+        fontStyle: 'bold',
+      }
+      this._touchLabels = {
+        jump: this.add.text(0, 0, 'JMP', labelStyle).setOrigin(0.5).setScrollFactor(0).setDepth(1001),
+        weapon1: this.add.text(0, 0, 'W1', labelStyle).setOrigin(0.5).setScrollFactor(0).setDepth(1001),
+        weapon2: this.add.text(0, 0, 'W2', labelStyle).setOrigin(0.5).setScrollFactor(0).setDepth(1001),
+        ability: this.add.text(0, 0, 'ABL', labelStyle).setOrigin(0.5).setScrollFactor(0).setDepth(1001),
+      }
+    }
+
+    // On mobile, the game is single-device — both players take turns on same phone
+    // During move phase on mobile, only the active-next-shooter moves (P1 first round)
+    this.mobileActiveMovePid = 1
   }
 
   // ─── PHASE MANAGEMENT ──────────────────────────────────────
@@ -143,6 +175,11 @@ export default class BattleScene extends Phaser.Scene {
   startMovePhase() {
     this.gs.phase = PHASE.MOVE
     this.gs.movePhaseTimer = 15
+
+    // On mobile, alternate which player moves each round
+    if (this.touch && this.touch.enabled) {
+      this.mobileActiveMovePid = this.mobileActiveMovePid === 1 ? 2 : 1
+    }
 
     if (this.phaseTimerEvent) this.phaseTimerEvent.destroy()
 
@@ -230,6 +267,9 @@ export default class BattleScene extends Phaser.Scene {
   // ─── INPUT HANDLING ────────────────────────────────────────
 
   onPointerDown() {
+    // On touch devices, the TouchControls system handles aiming
+    if (this.touch.enabled) return
+
     if (this.gs.phase === PHASE.COMBAT && !this.activeProjectile) {
       this.powerCharging = true
       this.aimPower = 0
@@ -238,6 +278,9 @@ export default class BattleScene extends Phaser.Scene {
   }
 
   onPointerUp() {
+    // On touch devices, the TouchControls system handles firing
+    if (this.touch.enabled) return
+
     if (this.powerCharging && this.gs.phase === PHASE.COMBAT) {
       this.powerCharging = false
       this.fireProjectile()
@@ -296,6 +339,7 @@ export default class BattleScene extends Phaser.Scene {
     const dt = Math.min(delta / 1000, 0.033) // cap at 30fps minimum
 
     this.handleMovement(dt)
+    this.handleTouchInput(dt)
     this.updateProjectile(dt)
     this.updateFragments(dt)
     this.updateExplosions(dt)
@@ -308,11 +352,13 @@ export default class BattleScene extends Phaser.Scene {
     this.entityGraphics.clear()
     this.projectileGraphics.clear()
     this.uiGraphics.clear()
+    this.touchGraphics.clear()
 
     this.drawEntities()
     this.drawProjectiles()
     this.drawAimingUI()
     this.drawHUD()
+    this.drawTouchUI()
   }
 
   handleMovement(dt) {
@@ -320,11 +366,104 @@ export default class BattleScene extends Phaser.Scene {
     // During combat: no movement
     if (this.gs.phase !== PHASE.MOVE) return
 
-    // Player 1: WASD
-    this.movePlayer(1, this.cursors.left.isDown, this.cursors.right.isDown, this.cursors.jump.isDown, dt)
+    if (this.touch.enabled) {
+      // Mobile: one player moves at a time (tap-to-switch via a future UI,
+      // for now both move with joystick — P1 in round 1, alternates)
+      const joy = getJoystickMovement(this.touch)
+      const jumpPressed = this.touch.buttons.jump.pressed || joy.jump
+      this.movePlayer(
+        this.mobileActiveMovePid,
+        joy.left,
+        joy.right,
+        jumpPressed,
+        dt
+      )
+    } else {
+      // Desktop: P1 = WASD, P2 = Arrow keys
+      this.movePlayer(1, this.cursors.left.isDown, this.cursors.right.isDown, this.cursors.jump.isDown, dt)
+      this.movePlayer(2, this.cursorsP2.left.isDown, this.cursorsP2.right.isDown, this.cursorsP2.up.isDown, dt)
+    }
+  }
 
-    // Player 2: Arrow keys
-    this.movePlayer(2, this.cursorsP2.left.isDown, this.cursorsP2.right.isDown, this.cursorsP2.up.isDown, dt)
+  handleTouchInput(dt) {
+    if (!this.touch.enabled) return
+
+    const pid = this.gs.activePlayer
+    const ps = this.gs.players[pid]
+    const body = this.playerBodies[pid]
+    const def = this.playerDefs[pid]
+
+    // Handle touch button presses (weapon switch, ability)
+    if (this.touch.justPressed.weapon1) {
+      ps.selectedWeapon = 0
+      this.touch.justPressed.weapon1 = false
+    }
+    if (this.touch.justPressed.weapon2) {
+      ps.selectedWeapon = 1
+      this.touch.justPressed.weapon2 = false
+    }
+    if (this.touch.justPressed.ability) {
+      this.useAbility(pid)
+      this.touch.justPressed.ability = false
+    }
+
+    // During combat: handle touch aim + fire
+    if (this.gs.phase === PHASE.COMBAT && !this.activeProjectile) {
+      // Update power charging
+      updateTouchAim(this.touch, dt)
+
+      // Get aim angle from touch position relative to player's screen position
+      const cam = this.cameras.main
+      const screenX = (body.x - cam.scrollX) * cam.zoom
+      const screenY = ((body.y - def.bodyHeight / 2) - cam.scrollY) * cam.zoom
+      const touchAngle = getTouchAimAngle(this.touch, screenX, screenY)
+
+      if (touchAngle !== null) {
+        this.aimAngle = touchAngle
+        this.aimPower = this.touch.aim.power
+      }
+
+      // Check if touch fire occurred
+      if (consumeTouchFire(this.touch)) {
+        if (this.touch.aim.power > 5) {
+          this.aimPower = this.touch.aim.power
+          this.fireProjectile()
+        }
+      }
+    }
+
+    // During move phase: switch active mobile player when combat phase switches
+    // (handled automatically in advanceCombatTurn/startMovePhase)
+  }
+
+  drawTouchUI() {
+    if (!this.touch.enabled) return
+
+    const pid = this.gs.activePlayer
+    const ps = this.gs.players[pid]
+
+    drawTouchControls(
+      this.touchGraphics,
+      this.touch,
+      this.gs.phase,
+      ps.selectedWeapon,
+      ps.abilityCooldown
+    )
+
+    // Update text label positions
+    if (this._touchLabels) {
+      const btns = this.touch.buttons
+      this._touchLabels.jump.setPosition(btns.jump.x, btns.jump.y)
+      this._touchLabels.weapon1.setPosition(btns.weapon1.x, btns.weapon1.y)
+      this._touchLabels.weapon2.setPosition(btns.weapon2.x, btns.weapon2.y)
+      this._touchLabels.ability.setPosition(btns.ability.x, btns.ability.y)
+
+      // Show weapon/ability labels only in combat
+      const inCombat = this.gs.phase === PHASE.COMBAT || this.gs.phase === PHASE.PROJECTILE_FLYING
+      this._touchLabels.weapon1.setVisible(inCombat)
+      this._touchLabels.weapon2.setVisible(inCombat)
+      this._touchLabels.ability.setVisible(inCombat)
+    }
   }
 
   movePlayer(pid, left, right, jump, dt) {
